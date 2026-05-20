@@ -10,6 +10,14 @@ from django.contrib.auth.models import User
 from rest_framework.authtoken.models import Token
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.shortcuts import render
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+from .models import WaterLevelReading
+import json
+
+# ==================== SENSOR DATA ENDPOINTS ====================
 
 @api_view(['POST'])
 def add_sensor_data(request):
@@ -21,23 +29,38 @@ def add_sensor_data(request):
 
 @api_view(['GET'])
 def get_latest_data(request):
-    latest = WaterSensorData.objects.last()
+    latest = WaterLevelReading.objects.last()
     if latest:
-        serializer = WaterSensorDataSerializer(latest)
-        return Response(serializer.data)
+        data = {
+            'id': latest.id,
+            'water_level': latest.water_level,
+            'timestamp': latest.timestamp,
+            'device_id': latest.device_id,
+            'battery_level': latest.battery_level,
+            'signal_strength': latest.signal_strength,
+        }
+        return Response(data)
     return Response({"error": "No data found"}, status=404)
 
 @api_view(['GET'])
 def get_all_data(request):
-    data = WaterSensorData.objects.all().order_by('-timestamp')
-    serializer = WaterSensorDataSerializer(data, many=True)
-    return Response(serializer.data)
+    data = WaterLevelReading.objects.all()
+    serialized = []
+    for item in data:
+        serialized.append({
+            'id': item.id,
+            'water_level': item.water_level,
+            'timestamp': item.timestamp,
+            'device_id': item.device_id,
+            'battery_level': item.battery_level,
+            'signal_strength': item.signal_strength,
+        })
+    return Response(serialized)
 
-# Add this new view function AFTER your existing views
 @api_view(['GET'])
 def get_stats(request):
     last_24h = timezone.now() - timedelta(hours=24)
-    recent_data = WaterSensorData.objects.filter(timestamp__gte=last_24h)
+    recent_data = WaterLevelReading.objects.filter(timestamp__gte=last_24h)
     
     stats = recent_data.aggregate(
         avg_level=Avg('water_level'),
@@ -52,6 +75,131 @@ def get_stats(request):
         'readings_count': recent_data.count()
     })
 
+# ==================== ESP8266 ENDPOINT ====================
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def water_level_api(request):
+    """
+    Endpoint for ESP8266 to send water level data
+    Expected JSON format:
+    {
+        "water_level_cm": 45.5,
+        "percentage": 45.5,
+        "device_id": "ESP8266_CANAL_01",
+        "battery_level": 100,
+        "rssi": -65
+    }
+    """
+    try:
+        # Parse the incoming data
+        data = json.loads(request.body)
+        
+        # Extract water level (supports both cm and percentage)
+        water_level_cm = data.get('water_level_cm')
+        percentage = data.get('percentage')
+        
+        # If percentage is sent, convert to cm (assuming max 100cm range)
+        if percentage is not None and water_level_cm is None:
+            water_level_cm = percentage
+        
+        # Validate water level
+        if water_level_cm is None:
+            return JsonResponse({'error': 'water_level_cm or percentage is required'}, status=400)
+        
+        # Get optional fields
+        device_id = data.get('device_id', 'ESP8266_01')
+        battery_level = data.get('battery_level')
+        signal_strength = data.get('rssi')
+        
+        # Save to WaterLevelReading model (create this model first)
+        # If you don't have this model, use WaterSensorData instead:
+        reading = WaterLevelReading.objects.create(
+            water_level=water_level_cm,
+            device_id=device_id,
+            battery_level=battery_level,
+            signal_strength=signal_strength,
+            timestamp=timezone.now()
+        )
+        
+        # Check for critical levels and determine alert
+        alert = None
+        alert_message = None
+        
+        if water_level_cm > 85:
+            alert = "CRITICAL_FLOOD"
+            alert_message = "🚨 CRITICAL FLOOD! EVACUATE IMMEDIATELY!"
+        elif water_level_cm > 70:
+            alert = "SEVERE_WARNING"
+            alert_message = "⚠️ SEVERE FLOOD WARNING! Prepare to evacuate!"
+        elif water_level_cm > 50:
+            alert = "FLOOD_WATCH"
+            alert_message = "📢 FLOOD WATCH! Monitor water levels closely!"
+        
+        return JsonResponse({
+            'status': 'success',
+            'id': reading.id,
+            'water_level': water_level_cm,
+            'alert': alert,
+            'alert_message': alert_message,
+            'message': 'Data received successfully'
+        }, status=201)
+        
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON format'}, status=400)
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+
+
+# ==================== ALTERNATIVE: Use WaterSensorData model if WaterLevelReading doesn't exist ====================
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def water_level_api_alternative(request):
+    """
+    Alternative endpoint using WaterSensorData model instead of WaterLevelReading
+    Use this if you haven't created the WaterLevelReading model yet
+    """
+    try:
+        data = json.loads(request.body)
+        
+        # Extract water level
+        water_level_cm = data.get('water_level_cm') or data.get('percentage')
+        
+        if water_level_cm is None:
+            return JsonResponse({'error': 'water_level_cm or percentage is required'}, status=400)
+        
+        # Save to WaterSensorData model
+        reading = WaterSensorData.objects.create(
+            water_level=water_level_cm,
+            device_id=data.get('device_id', 'ESP8266_01'),
+            timestamp=timezone.now()
+        )
+        
+        # Determine alert level
+        alert = None
+        if water_level_cm > 85:
+            alert = "CRITICAL_FLOOD"
+        elif water_level_cm > 70:
+            alert = "SEVERE_WARNING"
+        elif water_level_cm > 50:
+            alert = "FLOOD_WATCH"
+        
+        return JsonResponse({
+            'status': 'success',
+            'id': reading.id,
+            'water_level': water_level_cm,
+            'alert': alert,
+            'message': 'Data received successfully'
+        }, status=201)
+        
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+# ==================== AUTHENTICATION ENDPOINTS ====================
 
 @api_view(['POST'])
 def register(request):
